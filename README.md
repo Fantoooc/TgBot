@@ -1,4 +1,4 @@
-## JustFCbot
+## Telegram Bot
 
 English | [Русский](README.ru.md)
 
