@@ -1,122 +1,158 @@
-import asyncio
 import json
+import os
 import uuid
-from re import findall, subn
 from datetime import datetime, timedelta
+from html import escape
+from math import ceil
+from re import findall, sub
+from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User, InlineQueryResultArticle, InputTextMessageContent
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes, InlineQueryHandler, CommandHandler, ChosenInlineResultHandler
-from telegram.error import BadRequest, Forbidden
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    Update,
+    User,
+)
+from telegram.constants import ParseMode
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ChosenInlineResultHandler,
+    CommandHandler,
+    ContextTypes,
+    InlineQueryHandler,
+)
 
 API_TOKEN = ""
-ADMINS_IDS: list[int] = list()
+ADMINS_IDS: set[int] = set()
 
 BLACK_LIST: set[int] = set()
 NOTIFICATIONS_LIST: set[int] = set()
 VIPS_LIST: set[int] = set()
-EVENTS_LIST: dict[str, tuple] = {}
 
 CONFIG_LIST = "config.jsonl"
-LIST = "list.jsonl"
+LIST = "list.json"
 
-secret_messages: dict[str, tuple] = {}
-messages: dict[str, tuple[str, set]] = {}
+messages: dict[str, tuple[int, frozenset, int, str, str, str]] = {}
 
-SPECIAL_CHARS = set("!&$")
-FLAG_MAP = {
-    '!': "exc_flag",
-    '&': "vis_flag",
-    '$': "del_flag"
-}
+SPECIAL_CHARS = "!&$"
 
 def save_config() -> None:
     with open(CONFIG_LIST, 'w', encoding="utf-8") as f:
         f.write(json.dumps(API_TOKEN) + '\n')
-        f.write(json.dumps(ADMINS_IDS))
+        f.write(json.dumps(list(ADMINS_IDS)))
 
 def load_config() -> None:
     global API_TOKEN, ADMINS_IDS
     try:
         with open(CONFIG_LIST, 'r', encoding="utf-8") as f:
             API_TOKEN = json.loads(f.readline().strip())
-            ADMINS_IDS = json.loads(f.readline().strip())
+            ADMINS_IDS = set(json.loads(f.readline().strip()))
     except (FileNotFoundError, json.JSONDecodeError, IndexError):
         save_config()
 
 def save() -> None:
-    with open(LIST, 'w', encoding="utf-8") as f:
-        f.write(json.dumps(list(BLACK_LIST)) + '\n')
-        f.write(json.dumps(list(NOTIFICATIONS_LIST)) + '\n')
-        f.write(json.dumps(list(VIPS_LIST)) + '\n')
-        event_list = {k: list(v) for k, v in EVENTS_LIST.items()}
-        f.write(json.dumps(event_list))
+    data = {
+        "blacklist":     list(BLACK_LIST),
+        "notifications": list(NOTIFICATIONS_LIST),
+        "vips":          list(VIPS_LIST)
+    }
+    tmp = LIST + ".tmp"
+    with open(tmp, 'w', encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii = False, indent = 4)
+    os.replace(tmp, LIST)
 
 def load() -> None:
-    global BLACK_LIST, NOTIFICATIONS_LIST, EVENTS_LIST
+    global BLACK_LIST, NOTIFICATIONS_LIST, VIPS_LIST
     try:
-        with open(LIST, 'r', encoding="utf-8") as f:
-            BLACK_LIST = set(json.loads(f.readline().strip()))
-            NOTIFICATIONS_LIST = set(json.loads(f.readline().strip()))
-            VIPS_LIST = set(json.loads(f.readline().strip()))
-            EVENTS_LIST = {k: tuple(v) for k, v in json.loads(f.readline()).items()}
-    except (FileNotFoundError, json.JSONDecodeError, IndexError):
+        with open(LIST, 'r', encoding="utf-8") as f: data = json.load(f)
+    except FileNotFoundError:
         save()
+        return
+    except json.JSONDecodeError:
+        os.replace(LIST, LIST + ".broken")
+        save()
+        return
 
-def build_utumessage(user_id: int, query: str) -> InlineQueryResultArticle | None:
+    BLACK_LIST         = set(data.get("blacklist", []))
+    NOTIFICATIONS_LIST = set(data.get("notifications", []))
+    VIPS_LIST          = set(data.get("vips", []))
+
+async def parse_msg(user_id: int, query: str):
     parts = [ part.strip() for part in query.split('|') ]
-    if not parts or not parts[0]: return None
 
     main = parts[0].split(maxsplit=1)
     if len(main) < 2: return None
 
     raw = main[0]
-    raw_len = len(raw)
-    i = 0
-    while i < raw_len and raw[i] in SPECIAL_CHARS:
-        i += 1
-    prefix_chars = set(raw[:i])
-    flags = { name: (char in prefix_chars) for char, name in FLAG_MAP.items() }
-
-    target_id = raw[i:]
+    prefix_len = len(raw) - len(raw.lstrip(SPECIAL_CHARS))
+    prefix, target = raw[:prefix_len], raw[prefix_len:]
     message = main[1].strip()
 
-    if not (target_id and len(target_id) > 1 and (target_id[0] == '@' or target_id.isdigit()) and message): return None
-    placeholder_text = parts[1].strip() if len(parts) >= 2 and parts[1].strip() else "Message hided."
-    not_for_you_text = parts[2].strip() if len(parts) >= 3 and parts[2].strip() else "This message is not for you."
+    if len(target) < 2 or not message: return None
+    if target[0] == '@': target_id = target[1:]
+    elif target.isdigit(): target_id = int(target)
+    else: return None
+
+    flags = ('!' in prefix) | (('&' in prefix) << 1) | (('$' in prefix) << 2)
+
+    placeholder = parts[1] if len(parts) >= 2 and parts[1] else "Message hidden."
+    others = parts[2] if len(parts) >= 3 and parts[2] else "This message is not for you."
+
+    return user_id, frozenset((target_id, )), flags, message, others, placeholder
+
+async def build_msg(user_id: int, query: str) -> InlineQueryResultArticle | None:
+    data = await parse_msg(user_id, query)
+    if data is None: return None
+    _, users, flags, message, others, placeholder = data
+    ln = len(users)
+
+    targets = ", ".join(map(str, users))
+    if ln < 3: target = targets
+    else:      target = f"{targets}..."
 
     key = uuid.uuid4().hex[:16]
-    exc_flag, vis_flag, del_flag = flags["exc_flag"], flags["vis_flag"], flags["del_flag"]
 
-    if exc_flag:
-        secret_messages[key] = (user_id, target_id.lower(), not_for_you_text, message, exc_flag, vis_flag, del_flag)
-        to_target_desc = f"To anyone but {target_id}: {message}"
-        to_others_desc = f"To {target_id}: {not_for_you_text}"
+    if (flags & 1):
+        to_target_desc = f"To anyone but {target}: {message}"
+        to_others_desc = f"To them: {others}"
     else:
-        secret_messages[key] = (user_id, target_id.lower(), message, not_for_you_text, exc_flag, vis_flag, del_flag)
-        to_target_desc = f"To {target_id}: {message}"
-        to_others_desc = f"To anyone: {not_for_you_text}"
+        to_target_desc = f"To {target}: {message}"
+        to_others_desc = f"To anyone: {others}"
 
-    keyboard = InlineKeyboardMarkup([ [InlineKeyboardButton("Message", callback_data=f"utumessage:{key}")] ])
+    keyboard = InlineKeyboardMarkup([ [InlineKeyboardButton("Message", callback_data=f"msg:{key}")] ])
     return InlineQueryResultArticle(
         id = key,
-        title = "Send message",
-        description = f"{to_target_desc[:40]}...\nText in message: {placeholder_text[:40]}...\n{to_others_desc[:40]}...",
-        input_message_content = InputTextMessageContent(message_text = placeholder_text),
+        title = f"Send msg{'(Yr msg may b cut of)' if len(query)>=256 else ''}",
+        description = f"{to_target_desc[:40]}{'...' if len(to_target_desc) > 40 else ''}\nText in msg: {placeholder[:40]}{'...' if len(placeholder) > 40 else ''}\n{to_others_desc[:40]}{'...' if len(to_others_desc) > 40 else ''}",
+        input_message_content = InputTextMessageContent(message_text = placeholder),
         reply_markup = keyboard
     )
 
-def build_message(user_id: int, query: str) -> InlineQueryResultArticle | None:
-    data = messages.get(query)
-    if data is None: return None
-    keyboard = InlineKeyboardMarkup([ [InlineKeyboardButton("Send dmessage", callback_data=f"dmessage:{query}")] ])
+async def send_msg(user_id: int, query: str) -> InlineQueryResultArticle | None:
+    if user_id in BLACK_LIST: return None
+    qparts = query.split()
+    if len(qparts) < 2 or not (msg := messages.get(qparts[1])) or user_id != msg[0]: return None
+    key = qparts[1]
+    if (msg[2] & 1):
+        to_target_desc = f"To anyone but {', '.join(map(str, msg[1]))}: {msg[3]}"
+        to_others_desc = f"To them: {msg[4]}"
+    else:
+        to_target_desc = f"To {', '.join(map(str, msg[1]))}: {msg[3]}"
+        to_others_desc = f"To anyone: {msg[4]}"
+    keyboard = InlineKeyboardMarkup([ [InlineKeyboardButton("Message", callback_data=f"msg:{key}")] ])
     return InlineQueryResultArticle(
-        id = query,
-        title = "Send button to open dmessage",
-        input_message_content = InputTextMessageContent(message_text = "DMessage"),
+        id = key,
+        title = f"Send msg{'(Yr msg may b cut of)' if len(query)>=256 else ''}",
+        description = f"{to_target_desc[:40]}{'...' if len(to_target_desc) > 40 else ''}\nText in msg: {msg[5][:40]}{'...' if len(msg[5]) > 40 else ''}\n{to_others_desc[:40]}{'...' if len(to_others_desc) > 40 else ''}",
+        input_message_content = InputTextMessageContent(message_text = msg[5]),
         reply_markup = keyboard
     )
 
-def build_info(user: User, user_id: int) -> InlineQueryResultArticle:
+async def build_info(user: User, user_id: int) -> InlineQueryResultArticle:
     info_text = (
         f"Your first name: {user.first_name or '-'}\n"
         f"Your last name: {user.last_name or '-'}\n"
@@ -132,12 +168,19 @@ def build_info(user: User, user_id: int) -> InlineQueryResultArticle:
         input_message_content=InputTextMessageContent(message_text=info_text)
     )
 
-def build_delete(user_id: int, key: str) -> InlineQueryResultArticle | None:
-    if key not in secret_messages: return None
+def istarget(msg, user_id: int, username: str | None) -> bool:
+    if user_id in msg[1] or username in msg[1]: return True
+    if not username: return False
+    username = username.lower()
+    return any(isinstance(target, str) and target.lower() == username for target in msg[1])
 
-    sender_id = secret_messages[key][0]
-    target_id = secret_messages[key][1]
-    if not (sender_id == user_id or target_id == user_id): return None
+def may_delete(msg, user_id: int, username: str | None) -> bool:
+    if user_id == msg[0]: return True
+    return not (msg[2] & 1) and istarget(msg, user_id, username)
+
+async def build_delete(user_id: int, username: str | None, key: str) -> InlineQueryResultArticle | None:
+    msg = messages.get(key)
+    if msg is None or msg[2] & 4 or not may_delete(msg, user_id, username): return None
 
     keyboard = InlineKeyboardMarkup( [[InlineKeyboardButton("Confirm delete", callback_data=f"del:{key}")]] )
 
@@ -149,240 +192,120 @@ def build_delete(user_id: int, key: str) -> InlineQueryResultArticle | None:
         reply_markup=keyboard
     )
 
-def build_event(user_id: int, query: str):
-    if query.lower().startswith("list"):
-        events_list = [f"{i}. {v[0]}" for i, (_, v) in enumerate(EVENTS_LIST.items(), start=1)]
-        return InlineQueryResultArticle(
-            id=f"ev_list",
-            title="Send events list",
-            input_message_content=InputTextMessageContent( message_text="\n".join(events_list) )
-        )
-    elif query.lower().startswith("add "):
-        if not (user_id in ADMINS_IDS or user_id in VIPS_LIST): return
-        event = query[4:40].strip()
-        if not event: return
-        key = uuid.uuid4().hex[:16]
-        keyboard = InlineKeyboardMarkup([ [InlineKeyboardButton(f"Add event *{event}*", callback_data=f"ev_add:{key}:{event}")] ])
-        return InlineQueryResultArticle(
-            id=f"ev_add-{key}",
-            title=f"Add event *{event}*",
-            input_message_content=InputTextMessageContent( message_text="Click on button below to add your event" ),
-            reply_markup=keyboard
-        )
-    elif query.lower().startswith("remove "):
-        if not (user_id in ADMINS_IDS or user_id in VIPS_LIST): return
-        search_key = query[7:40].strip().lower()
-        results = []
-
-        for key, event_data in EVENTS_LIST.items():
-            event_name = event_data[0]
-            if search_key in event_name.lower() and len(results) < 50:
-                keyboard = InlineKeyboardMarkup([ [InlineKeyboardButton(f"Remove event *{event_name}*", callback_data=f"ev_remove:{key}:{event_name}")] ])
-                results.append(
-                    InlineQueryResultArticle(
-                        id=f"ev_remove-{key}",
-                        title=f"Remove: *{event_name}*",
-                        description=f"ID: {key}",
-                        input_message_content=InputTextMessageContent( message_text=f"Click the button below to remove event: *{event_name}*" ),
-                        reply_markup=keyboard
-                    )
-                )
-        return results
-
-    search_key = query.strip().lower()
-    results = []
-
-    for key, event_data in EVENTS_LIST.items():
-        event_name = event_data[0]
-
-        if search_key in event_name.lower() and len(results) < 50:
-            diff = datetime.now() - datetime.fromisoformat(event_data[1])
-
-            days = diff.days
-            hours, remainder = divmod(diff.seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-
-            results.append(
-                InlineQueryResultArticle(
-                    id=f"ev_date:{key}",
-                    title=f"{event_name}",
-                    description=f"Share *{event_name} event",
-                    input_message_content=InputTextMessageContent(
-                        message_text=f"С момента *{event_name}* прошло {days}дн. {hours}ч. {minutes}мин. {seconds}с."
-                    )
-                )
-            )
-    return results
-
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.inline_query.from_user.id
     if user_id in BLACK_LIST: return
 
-    query = update.inline_query.query.strip()
+    query = update.inline_query.query
+    if not query: return
     results = [ ]
+    result = None
 
-    if query.lower() == "info":
-        results.append(build_info(update.inline_query.from_user, user_id))
-    elif query.lower().startswith("delete"):
-        delete_result = build_delete(user_id, query[6:].strip())
-        if delete_result: results.append(delete_result)
-    elif query.lower().startswith("event"):
-        event = build_event(user_id, query[5:].strip())
-        if event:
-            if isinstance(event, list): results.extend(event)
-            else: results.append(event)
-    elif query.lower().startswith("dmessage"):
-        message_result = build_message(user_id, query[8:].strip())
-        if message_result: results.append(message_result)
-    elif query.lower().startswith("message"):
-        message_result = build_utumessage(user_id, query[7:].strip())
-        if message_result: results.append(message_result)
+    if query.lower() == "info": result = await build_info(update.inline_query.from_user, user_id)
+    elif query.lower().startswith("delete"): result = await build_delete(user_id, update.inline_query.from_user.username, query[6:].strip())
+    elif query.lower().startswith("send"): result = await send_msg(user_id, query)
+    else: result = await build_msg(user_id, query)
+
+    if result: results.append(result)
 
     try: await update.inline_query.answer(results, cache_time=5, is_personal=True)
     except BadRequest: return
 
 async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     result = update.chosen_inline_result
-    key = result.result_id
-    message_data = secret_messages.get(key)
-    if not message_data: return
-    await notify_admins(context, f"New message sent from: {message_data[0]}")
+    from_user = result.from_user.id
+    msg = await parse_msg(from_user, result.query)
+    if not msg: return
+    messages[result.result_id] = msg
+    notify(context, f"New message sent from: {from_user}")
+
+def notify(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    if NOTIFICATIONS_LIST: context.application.create_task(notify_admins(context, text))
 
 async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     for admin_id in NOTIFICATIONS_LIST:
-        try:
-            await context.bot.send_message(chat_id=admin_id, text=text)
-        except Exception as e:
-            print(f"Failed to notify admin {admin_id}: {e}")
+        try: await context.bot.send_message(chat_id=admin_id, text=text)
+        except TelegramError as e: print(f"Failed to notify admin {admin_id}: {e}")
 
 def mark_seen(data: tuple) -> tuple:
-    if data[2].endswith("  ✓✓"): return data
-    return data[:2] + (data[2]+"  ✓✓",) + data[3:]
+    if data[2] & 8: return data
+    return data[:2] + (data[2] | 8, ) + data[3:]
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     clicker_id = query.from_user.id
-    if clicker_id in BLACK_LIST: return
+    if clicker_id in BLACK_LIST:
+        await query.answer(cache_time=3600)
+        return
     clicker_username = query.from_user.username
 
     message = query.data.split(':')
-    act = message[0]
-    message_key = message[1]
+    act, message_key = message[0], message[1]
 
-    if act == "dmessage":
-        raw = messages.get(message_key)
-        if raw is None:
-            await query.answer()
-            return
-        data, users = raw[0], raw[1]
-        if clicker_username and clicker_username.lower() in users:
-            try:
-                await context.bot.send_message(chat_id=clicker_id, text=f"Message key: {message_key}\nMessage:\n{data}")
-                await query.answer()
-                await notify_admins(context, f"User {clicker_id} opened dmessage")
-            except Forbidden:
-                await query.answer("You need to start a chat with the bot first.", show_alert=True)
-            return
-        await query.answer("This message is not for you.", show_alert=True, cache_time=3600)
-        return
-
-    if clicker_id in ADMINS_IDS or clicker_id in VIPS_LIST:
-        if act == "ev_add":
-            event = message[2]
-            event_time = datetime.now().isoformat()
-            EVENTS_LIST[message_key] = (event, event_time)
-            save()
-            await query.edit_message_text(f"Event *{event}* added and saved\nSaved date in iso format is: {event_time}")
-            await query.answer()
-            return
-        elif act == "ev_remove":
-            event = message[2]
-            if message_key not in EVENTS_LIST:
-                await query.answer("Event already removed.", show_alert=True)
-                return
-            del EVENTS_LIST[message_key]
-            save()
-            await query.edit_message_text(f"Event *{event}* was removed")
-            await query.answer()
+    if act == "msg":
+        msg = messages.get(message_key)
+        if not msg:
+            try: await query.answer(text="No message in temp data.", show_alert=False, cache_time=3600)
+            except BadRequest: return
             return
 
-    message_data = secret_messages.get(message_key)
-    if not message_data:
-        try: await query.answer(text="No message in temp data.", show_alert=True, cache_time=3600)
-        except BadRequest: return
-        return
+        exc, vis  = msg[2] & 1, msg[2] & 2
+        targets = ", ".join(map(str, msg[1]))
+        tick = "  ✓✓" if msg[2] & 8 else ""
 
-    text = ""
-
-    sender = message_data[0]
-    target = message_data[1]
-
-    target_text = message_data[2]
-    other_text = message_data[3]
-
-    exc_flag = message_data[4]
-    vis_flag = message_data[5]
-    del_flag = message_data[6]
-
-    clicker_sender = clicker_id == sender
-    clicker_target = str(clicker_id) == target or (clicker_username and clicker_username.lower() == target[1:])
-
-    key_message = f"\n\n\nMessage id is: {message_key}"
-
-    if clicker_sender: text = f"Message for {target}:\n{target_text}\n\nMessage for anyone:\n{other_text}{key_message}"
-    elif clicker_target:
-        if exc_flag: text = f"Message:\n{target_text}"
-        else:
-            if vis_flag:
-                text = f"Message for you:\n{target_text}\n\nMessage for anyone:\n{other_text}{key_message}"
+        if clicker_id == msg[0]:
+            if exc: text = f"Message for anyone but {targets}:\n{msg[3]}\n\nMessage for {targets}:\n{msg[4]}\n\n{message_key}"
+            else: text = f"Message for {targets}:\n{msg[3]}{tick}\n\nMessage for anyone:\n{msg[4]}\n\n{message_key}"
+        elif istarget(msg, clicker_id, clicker_username):
+            if exc: text = f"Message:\n{msg[4]}"
             else:
-                text = f"Message:\n{target_text}{key_message}"
-            secret_messages[message_key] = mark_seen(message_data)
-    else:
-        if exc_flag and vis_flag: text = f"Message for anyone:\n{other_text}\n\nMessage for {target}:\n{target_text}"
-        else: text = f"Message:\n{other_text}"
+                if vis: text = f"Message for you:\n{msg[3]}{tick}\n\nMessage for anyone:\n{msg[4]}\n\n{message_key}"
+                else: text = f"Message:\n{msg[3]}{tick}\n\n{message_key}"
+                messages[message_key] = mark_seen(msg)
+        else:
+            if exc:
+                if vis: text = f"Message for anyone:\n{msg[3]}\n\nMessage for {targets}:\n{msg[4]}"
+                else: text = f"Message for anyone but {targets}:\n{msg[3]}"
+            else: text = f"Message:\n{msg[4]}"
 
-    if act == "del":
-        if del_flag:
-            await query.answer("This message cannot be deleted.", show_alert=True, cache_time=3600)
+        notify(context = context, text = f"User {clicker_username} clicked on {message_key}")
+
+        if len(text) <= 200: await query.answer(text = text, show_alert = True, cache_time = 10)
+        else:
+            pages = ceil(len(text) / 180)
+            if len(message) < 3:
+                buttons = iter(
+                    InlineKeyboardButton(f"Message(Part {i+1})", callback_data=f"msg:{message_key}:{i}")
+                    for i in range(pages)
+                )
+                rows_count  = ceil(pages / 3)
+                base, extra = divmod(pages, rows_count)
+
+                keyboard = [
+                    [next(buttons) for _ in range(base + (r < extra))]
+                    for r in range(rows_count)
+                ]
+
+                try: await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+                except TelegramError as e: print(e)
+                await query.answer()
+                return
+
+            page = min(max(int(message[2]), 0), pages - 1)
+            chunk = text[page * 180:(page + 1) * 180]
+            await query.answer(text=f"{chunk}\n\n({page + 1}/{pages})", show_alert=True, cache_time = 10)
             return
-        if not (clicker_sender or (clicker_target and not exc_flag)):
-            await query.answer("You can't delete this message.", show_alert=True, cache_time=3600)
-            return
-        if message_key not in secret_messages:
-            await query.answer("Message already deleted.", show_alert=True, cache_time=3600)
-            return
+    elif act == "del":
+        if (msg := messages.get(message_key)):
+            if msg[2] & 4: await query.answer("This message cannot be deleted.", show_alert=False, cache_time=3600)
+            elif not may_delete(msg, clicker_id, clicker_username): await query.answer("You can't delete this message.", show_alert=False, cache_time=3600)
+            else:
+                del messages[message_key]
+                await query.edit_message_text(f"Message {message_key} burned 🔥.")
+                await query.answer()
+        else: await query.answer("Message is not in db.", show_alert=False, cache_time=3600)
 
-        del secret_messages[message_key]
-        await query.edit_message_text(f"Message {message_key} burned 🔥.")
-        await query.answer()
-        return
-
-    if act == "senddm":
-        if not (clicker_sender or clicker_target or exc_flag): return
-        try:
-            await context.bot.send_message(chat_id=clicker_id, text=text)
-            await query.answer()
-        except Forbidden:
-            await query.answer("Couldn't reach that user — they need to start a chat with the bot first.", show_alert=True)
-        return
-
-    await notify_admins(context,f"User @{clicker_username} ({clicker_id}) clicked on {message_key}")
-    if len(text) <= 200:
-        await query.answer(text=text, show_alert=True)
-    else:
-        if not (clicker_sender or clicker_target or exc_flag): return
-        await query.answer(text="Message is too long for a popup.\nTap the button below to send full text in bot chat.\nIf you don't have a chat with the bot you won't get the message.", show_alert=True)
-        keyboard = [[
-            InlineKeyboardButton("Message", callback_data=f"utumessage:{message_key}"),
-            InlineKeyboardButton("Open full message in DM", callback_data=f"senddm:{message_key}")
-        ]]
-        try:
-            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-        except Exception as e:
-            if "Message is not modified" not in str(e): raise
-
-async def notifications_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def notifications_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ADMINS_IDS: return
     if user_id in NOTIFICATIONS_LIST:
@@ -394,7 +317,7 @@ async def notifications_command(update: Update, context: ContextTypes.DEFAULT_TY
         save()
         await update.message.reply_text("Notifications enabled.")
 
-async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ADMINS_IDS: return
     if not context.args:
@@ -417,7 +340,7 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         await update.message.reply_text(f"User {target} is already blocked.")
 
-async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ADMINS_IDS: return
     if not context.args:
@@ -436,7 +359,7 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         await update.message.reply_text(f"User {target} is not in the blacklist.")
 
-async def blacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ADMINS_IDS: return
     if not BLACK_LIST:
@@ -444,42 +367,42 @@ async def blacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     await update.message.reply_text("Blacklist:\n" + "\n".join(str(i) for i in BLACK_LIST))
 
-async def message_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def message_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Use /message in a private chat with the bot.")
+        return
     user_id = update.effective_user.id
     if user_id in BLACK_LIST: return
     if not context.args:
         await update.message.reply_text("Usage: /message <message>")
         return
 
-    diff = int(86400 - (datetime.now() - start_time).total_seconds())
-    if diff < 0: return
+    diff = end_time - datetime.now(tz=ZoneInfo("Europe/Moscow"))
+    hours, rem       = divmod(int(diff.total_seconds()), 3600)
+    minutes, seconds = divmod(rem, 60)
 
-    hours, remainder = divmod(diff, 3600)
-    minutes, seconds = divmod(remainder, 60)
+    raw = " ".join(context.args)
+    matches = findall(r"=([!&$]*)@(\w+)", raw)
+    usernames = frozenset(u for _, u in matches)
+    if not usernames:
+        await update.message.reply_text("You need to specify one or more recipients in the message.")
+        return
+    prefix = ''.join(p for p, _ in matches)
+    flags = ('!' in prefix) | (('&' in prefix) << 1) | (('$' in prefix) << 2)
+    message    = sub(r"=[!&$]*@\w+", "", raw).strip()[:3500]
+
+    if not message:
+        await update.message.reply_text("Message is empty.")
+        return
 
     key = uuid.uuid4().hex[:16]
-    raw = " ".join(context.args)
-    usernames = set(findall(r"=\$\@(\w+)", raw)) | {update.effective_user.username}
-    usernames = {name.lower() for name in usernames if name}
-    message, count = subn(r"=\$\@\w+", "", raw)
-    message = message.strip()
-    messages[key] = (message, usernames)
+    messages[key] = (user_id, usernames, flags, message, "This message is not for you.", "Message hidden.")
 
     await update.message.reply_text(
-        text = f"Remaining time: {hours}ч. {minutes}мин. {seconds}с.\nMessage key: {key}\nUsers who can see message by key:\n{'@' + '\n@'.join(usernames)}\nMessage:\n{message}"
+        text = f"Remaining time: {hours}h. {minutes}min. {seconds}s.\nMessage key: <code>{key}</code>\nUsers who can see message by key:\n{'Anyone but:\n' if flags & 1 else ''}@{'\n@'.join(usernames)}\nMessage:\n{escape(message[:1000])}",
+        parse_mode=ParseMode.HTML
     )
-    await notify_admins(context, f"New message from {user_id}")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    text = (
-        f"Your first name: {update.effective_user.first_name}\n"+
-        f"Your last name: {update.effective_user.last_name}\n"
-        f"Your username: @{update.effective_user.username}\n"
-        f"Your telegram ID: {user_id}"
-    )
-    if (user_id in ADMINS_IDS): text += "\nYou are an admin"
-    await update.message.reply_text(text)
+    notify(context, f"New message from {user_id}")
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -504,19 +427,19 @@ def main():
     app.add_handler(ChosenInlineResultHandler(chosen_inline_result))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
 
-    app.add_handler(CommandHandler("notifications", notifications_command))
-    app.add_handler(CommandHandler("block", block_command))
-    app.add_handler(CommandHandler("unblock", unblock_command))
-    app.add_handler(CommandHandler("blacklist", blacklist_command))
-    app.add_handler(CommandHandler("message", message_command))
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("notifications", notifications_cmd))
+    app.add_handler(CommandHandler(["block",   "ban"],     block_cmd))
+    app.add_handler(CommandHandler(["unblock", "unban"],   unblock_cmd))
+    app.add_handler(CommandHandler("blacklist", blacklist_cmd))
+    app.add_handler(CommandHandler(["message", "msg"], message_cmd))
     app.add_handler(CommandHandler("info", info))
 
     print("Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
-    start_time = datetime.now()
+    start_time = datetime.now(tz=ZoneInfo("Europe/Moscow"))
+    end_time   = start_time + timedelta(days = 1)
     load_config()
     load()
     main()
